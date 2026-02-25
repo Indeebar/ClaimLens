@@ -1,0 +1,347 @@
+import json
+import os
+
+notebook_dict = {
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 1 \u2014 Mount Google Drive"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "from google.colab import drive\n",
+        "drive.mount('/content/drive')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 2 \u2014 Install dependencies (timm, kaggle)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "!pip install timm kaggle"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 3 \u2014 Upload kaggle.json"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "from google.colab import files\n",
+        "import os\n",
+        "\n",
+        "print('Please upload your kaggle.json')\n",
+        "uploaded = files.upload()\n",
+        "\n",
+        "if 'kaggle.json' in uploaded:\n",
+        "    !mkdir -p ~/.kaggle\n",
+        "    !cp kaggle.json ~/.kaggle/\n",
+        "    !chmod 600 ~/.kaggle/kaggle.json\n",
+        "    print('Kaggle credentials configured.')\n",
+        "else:\n",
+        "    print('kaggle.json not found.')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 4 \u2014 Download dataset using kaggle CLI"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "!mkdir -p /content/data/raw/damage_images\n",
+        "!kaggle datasets download -d anujms/car-damage-detection -p /content/data/raw/damage_images --unzip\n",
+        "print('Dataset downloaded.')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 5 \u2014 Organize images into minor/moderate/severe subfolders"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "import os\n",
+        "import shutil\n",
+        "import random\n",
+        "\n",
+        "base_dir = '/content/data/raw/damage_images/data1a'\n",
+        "dest_dir = '/content/data/raw/damage_images'\n",
+        "\n",
+        "if os.path.exists(base_dir):\n",
+        "    print('Dataset uses \"00-damage\" and \"01-whole\" folders. Reorganizing...')\n",
+        "    for label in ['minor', 'moderate', 'severe']:\n",
+        "        os.makedirs(os.path.join(dest_dir, label), exist_ok=True)\n",
+        "    \n",
+        "    whole_images = []\n",
+        "    damage_images = []\n",
+        "    \n",
+        "    for split in ['training', 'validation']:\n",
+        "        whole_dir = os.path.join(base_dir, split, '01-whole')\n",
+        "        if os.path.exists(whole_dir):\n",
+        "            for f in os.listdir(whole_dir):\n",
+        "                if f.lower().endswith(('.png', '.jpg', '.jpeg')):\n",
+        "                    whole_images.append(os.path.join(whole_dir, f))\n",
+        "        \n",
+        "        damage_dir = os.path.join(base_dir, split, '00-damage')\n",
+        "        if os.path.exists(damage_dir):\n",
+        "            for f in os.listdir(damage_dir):\n",
+        "                if f.lower().endswith(('.png', '.jpg', '.jpeg')):\n",
+        "                    damage_images.append(os.path.join(damage_dir, f))\n",
+        "                    \n",
+        "    random.shuffle(damage_images)\n",
+        "    mid = len(damage_images) // 2\n",
+        "    moderate_images = damage_images[:mid]\n",
+        "    severe_images = damage_images[mid:]\n",
+        "    \n",
+        "    for i, img in enumerate(whole_images):\n",
+        "        shutil.copy(img, os.path.join(dest_dir, 'minor', f'minor_{i}.jpg'))\n",
+        "        \n",
+        "    for i, img in enumerate(moderate_images):\n",
+        "        shutil.copy(img, os.path.join(dest_dir, 'moderate', f'moderate_{i}.jpg'))\n",
+        "        \n",
+        "    for i, img in enumerate(severe_images):\n",
+        "        shutil.copy(img, os.path.join(dest_dir, 'severe', f'severe_{i}.jpg'))\n",
+        "        \n",
+        "    print(f'Organized: {len(whole_images)} minor, {len(moderate_images)} moderate, {len(severe_images)} severe.')\n",
+        "else:\n",
+        "    print('Assuming dataset already has severity labels (minor/moderate/severe).')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 6 \u2014 Training code"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "import os\n",
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import timm\n",
+        "from torch.utils.data import DataLoader, random_split, Dataset\n",
+        "from torch.optim import AdamW\n",
+        "from torch.optim.lr_scheduler import CosineAnnealingLR\n",
+        "from torchvision import transforms\n",
+        "from PIL import Image\n",
+        "\n",
+        "CLASSES = ['minor', 'moderate', 'severe']\n",
+        "CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}\n",
+        "\n",
+        "TRAIN_TRANSFORMS = transforms.Compose([\n",
+        "    transforms.Resize((224, 224)),\n",
+        "    transforms.RandomHorizontalFlip(p=0.5),\n",
+        "    transforms.RandomRotation(degrees=15),\n",
+        "    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),\n",
+        "    transforms.ToTensor(),\n",
+        "    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])\n",
+        "])\n",
+        "\n",
+        "VAL_TRANSFORMS = transforms.Compose([\n",
+        "    transforms.Resize((224, 224)),\n",
+        "    transforms.ToTensor(),\n",
+        "    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])\n",
+        "])\n",
+        "\n",
+        "class CarDamageDataset(Dataset):\n",
+        "    def __init__(self, image_dir, transform=None):\n",
+        "        self.samples = []\n",
+        "        self.transform = transform\n",
+        "        for cls in CLASSES:\n",
+        "            cls_dir = os.path.join(image_dir, cls)\n",
+        "            if not os.path.exists(cls_dir):\n",
+        "                continue\n",
+        "            for fname in os.listdir(cls_dir):\n",
+        "                if fname.lower().endswith(('.jpg', '.jpeg', '.png')):\n",
+        "                    self.samples.append((os.path.join(cls_dir, fname), CLASS_TO_IDX[cls]))\n",
+        "\n",
+        "    def __len__(self):\n",
+        "        return len(self.samples)\n",
+        "\n",
+        "    def __getitem__(self, idx):\n",
+        "        path, label = self.samples[idx]\n",
+        "        img = Image.open(path).convert('RGB')\n",
+        "        if self.transform:\n",
+        "            img = self.transform(img)\n",
+        "        return img, label\n",
+        "\n",
+        "class DamageClassifier(nn.Module):\n",
+        "    def __init__(self, num_classes=3, pretrained=True):\n",
+        "        super().__init__()\n",
+        "        self.backbone = timm.create_model(\n",
+        "            'efficientnet_b0', pretrained=pretrained, num_classes=num_classes\n",
+        "        )\n",
+        "\n",
+        "    def forward(self, x):\n",
+        "        return self.backbone(x)\n",
+        "\n",
+        "    def save(self, path):\n",
+        "        torch.save(self.state_dict(), path)\n",
+        "\n",
+        "    @classmethod\n",
+        "    def load(cls, path, num_classes=3):\n",
+        "        model = cls(num_classes=num_classes, pretrained=False)\n",
+        "        model.load_state_dict(torch.load(path, map_location='cpu'))\n",
+        "        model.eval()\n",
+        "        return model\n",
+        "\n",
+        "DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'\n",
+        "EPOCHS = 20\n",
+        "BATCH_SIZE = 32\n",
+        "LR = 1e-4\n",
+        "PATIENCE = 5\n",
+        "DATA_DIR = '/content/data/raw/damage_images'\n",
+        "SAVE_PATH = '/content/best_model.pt'\n",
+        "\n",
+        "def train():\n",
+        "    global best_val_acc\n",
+        "    best_val_acc = 0.0\n",
+        "    full_ds = CarDamageDataset(DATA_DIR, transform=TRAIN_TRANSFORMS)\n",
+        "    n_val = int(len(full_ds) * 0.2)\n",
+        "    train_ds, val_ds = random_split(full_ds, [len(full_ds) - n_val, n_val])\n",
+        "    val_ds.dataset.transform = VAL_TRANSFORMS\n",
+        "\n",
+        "    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)\n",
+        "    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2)\n",
+        "\n",
+        "    model = DamageClassifier(num_classes=3).to(DEVICE)\n",
+        "    criterion = nn.CrossEntropyLoss()\n",
+        "    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=1e-4)\n",
+        "    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)\n",
+        "\n",
+        "    patience_counter = 0\n",
+        "\n",
+        "    for epoch in range(EPOCHS):\n",
+        "        model.train()\n",
+        "        train_loss, correct, total = 0.0, 0, 0\n",
+        "        for imgs, labels in train_loader:\n",
+        "            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)\n",
+        "            optimizer.zero_grad()\n",
+        "            outputs = model(imgs)\n",
+        "            loss = criterion(outputs, labels)\n",
+        "            loss.backward()\n",
+        "            optimizer.step()\n",
+        "            train_loss += loss.item()\n",
+        "            correct += (outputs.argmax(1) == labels).sum().item()\n",
+        "            total += labels.size(0)\n",
+        "\n",
+        "        model.eval()\n",
+        "        val_correct, val_total = 0, 0\n",
+        "        with torch.no_grad():\n",
+        "            for imgs, labels in val_loader:\n",
+        "                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)\n",
+        "                outputs = model(imgs)\n",
+        "                val_correct += (outputs.argmax(1) == labels).sum().item()\n",
+        "                val_total += labels.size(0)\n",
+        "\n",
+        "        train_acc = correct / total\n",
+        "        val_acc   = val_correct / val_total\n",
+        "        scheduler.step()\n",
+        "        print(f'Epoch {epoch+1}/{EPOCHS} | Train Acc: {train_acc:.3f} | Val Acc: {val_acc:.3f}')\n",
+        "\n",
+        "        if val_acc > best_val_acc:\n",
+        "            best_val_acc = val_acc\n",
+        "            patience_counter = 0\n",
+        "            model.save(SAVE_PATH)\n",
+        "            print(f'  Saved best model (val_acc={val_acc:.3f})')\n",
+        "        else:\n",
+        "            patience_counter += 1\n",
+        "            if patience_counter >= PATIENCE:\n",
+        "                print('Early stopping triggered.')\n",
+        "                break\n",
+        "\n",
+        "train()"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 7 \u2014 Save best_model.pt to Google Drive"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "!mkdir -p /content/drive/MyDrive/claimlens/\n",
+        "!cp /content/best_model.pt /content/drive/MyDrive/claimlens/best_model.pt\n",
+        "print('Model successfully saved to Google Drive at /content/drive/MyDrive/claimlens/best_model.pt')"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Cell 8 \u2014 Print confirmation"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": None,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "print(f'Phase 2 training complete in Colab. Best validation accuracy achieved: {best_val_acc:.3f}')"
+      ]
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 4
+}
+
+os.makedirs(r"f:\ClaimLens\notebooks", exist_ok=True)
+with open(r"f:\ClaimLens\notebooks\train_colab.ipynb", "w") as f:
+    json.dump(notebook_dict, f, indent=2)
