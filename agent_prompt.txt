@@ -1,0 +1,153 @@
+You are an expert Python/ML engineer. Your job is to build the ClaimLens project from scratch by following the implementation plan in the README.md exactly. Read the entire README.md first before writing a single line of code.
+
+---
+
+## RULES YOU MUST FOLLOW
+
+1. **Read README.md fully before starting.** Understand all 8 phases before touching any file.
+2. **Execute phases in strict order:** Phase 0 → 1 → 2 → 3 → 4 → 5. Do not skip ahead.
+3. **Push to GitHub after every phase completes.** Commit message must say which phase was completed (e.g. "Phase 2 complete: DL module trained, best_model.pt saved").
+4. **STOP after Phase 5 (FastAPI is working locally).** Do NOT proceed to Docker or AWS. Wait for my review.
+5. **If you need any API key, secret, credential, or external account** (AWS, Kaggle, Hugging Face, etc.) — STOP and ask me before continuing. Do not guess or skip.
+6. **If a dataset download fails** — try the fallback listed below before asking me. If both fail, ask me.
+7. **Verify each phase** using the VERIFY step at the end of that phase in the README. Do not move to the next phase until verification passes.
+8. **Never commit** data/, *.pt, *.pkl, .env, or *.pem files to GitHub.
+
+---
+
+## DATASETS — USE EXACTLY THESE (PRIMARY FIRST, FALLBACK IF PRIMARY FAILS)
+
+### DL Module — Car Damage Images
+- **PRIMARY:** `kaggle datasets download -d anujms/car-damage-detection -p data/raw/damage_images --unzip`
+- **FALLBACK:** `kaggle datasets download -d lplenka/coco-car-damage-detection-dataset -p data/raw/damage_images --unzip`
+- **If both fail:** Go to universe.roboflow.com, search "car damage", download any dataset with 500+ images, organize into data/raw/damage_images/minor/, /moderate/, /severe/ folders manually.
+
+After downloading, you MUST organize images into 3 subfolders:
+```
+data/raw/damage_images/
+    minor/       ← low damage images
+    moderate/    ← medium damage images
+    severe/      ← heavily damaged images
+```
+If the downloaded dataset uses different label names (e.g. "01", "02" or "damage"/"nodamage"), map them to minor/moderate/severe yourself based on visual inspection or metadata. If it is binary (damaged/undamaged), treat "undamaged" as minor and split "damaged" evenly into moderate and severe.
+
+### ML Module — Insurance Claims Tabular
+- **PRIMARY:** `kaggle datasets download -d shivamb/vehicle-claim-fraud-detection -p data/raw/claims_tabular --unzip`
+- **FALLBACK:** `kaggle datasets download -d mastmustu/insurance-claims-fraud-data -p data/raw/claims_tabular --unzip`
+- **If both fail:** Ask me.
+
+The tabular CSV must have a column called `fraud_reported` with values Y/N. If the column is named differently, rename it to `fraud_reported` in the preprocessing step.
+
+---
+
+## WHAT TO DO — STEP BY STEP
+
+### STEP 1 — Initialize repo
+```
+git init claimlens
+cd claimlens
+git remote add origin <your GitHub repo URL>
+```
+Create the full directory structure from the README exactly. Create all empty placeholder files. Create .gitignore. Make first commit: "Phase 0: repo structure initialized". Push.
+
+---
+
+### STEP 2 — Phase 1: Environment + Data
+- Create the virtual environment and install all packages in the exact order listed in the README.
+- Set up Kaggle credentials (ask me for the kaggle.json token if you don't have it).
+- Run `bash scripts/download_data.sh` using the PRIMARY datasets above.
+- Verify both data folders have files.
+- Commit: "Phase 1 complete: environment setup, datasets downloaded". Push.
+
+---
+
+### STEP 3 — Phase 2: DL Module
+- Write all 4 files exactly as specified in the README: dataset.py, model.py, train.py, predict.py.
+- Organize the downloaded images into minor/moderate/severe subfolders.
+- Run `python models/damage_classifier/train.py`.
+- Training must complete and save best_model.pt.
+- Target val_acc > 0.70. If you get 0.60–0.70, that is acceptable — note it in the commit message.
+- If val_acc < 0.60 after 10 epochs, try: reduce learning rate to 5e-5, add more augmentation, check class balance.
+- Run the VERIFY step: call predict_damage() on one image and confirm it returns a dict with severity, severity_idx, confidence.
+- Do NOT commit best_model.pt. Add *.pt to .gitignore.
+- Commit: "Phase 2 complete: EfficientNet-B0 trained, val_acc=X.XX". Push.
+
+---
+
+### STEP 4 — Phase 3: NLP Module
+- Create fraud_patterns.json exactly as in the README.
+- Write embed.py and anomaly_score.py exactly as in the README.
+- Run the VERIFY step: confirm score_text('car caught fire no witnesses') > 0.6 and score_text('minor scratch on rear bumper') < 0.2.
+- Commit: "Phase 3 complete: NLP anomaly scorer working". Push.
+
+---
+
+### STEP 5 — Phase 4: ML Fusion Module
+- Write feature_eng.py, train.py, shap_explain.py exactly as in the README.
+- Run `python models/fraud_classifier/train.py`.
+- Training must complete and save xgb_fraud_model.pkl.
+- Target CV AUC > 0.85. If AUC is 0.75–0.85, check if all feature columns are present — some may be missing from the dataset. Add whichever India-specific features are computable from available columns.
+- Do NOT commit xgb_fraud_model.pkl. Add *.pkl to .gitignore.
+- Commit: "Phase 4 complete: XGBoost trained, CV AUC=X.XX". Push.
+
+---
+
+### STEP 6 — Phase 5: FastAPI
+- Write schemas.py, routers/claim.py, and main.py exactly as in the README.
+- Run `uvicorn api.main:app --reload`.
+- All 4 models must load on startup without errors.
+- Open http://localhost:8000/docs — Swagger UI must show the POST /api/v1/predict/fraud endpoint.
+- Test the endpoint manually: send a POST request with a sample car image and claim JSON. Confirm you get a FraudPredictionResponse back with fraud_probability, risk_level, damage_severity, top_shap_factors.
+- Fix any errors before committing.
+- Commit: "Phase 5 complete: FastAPI working, all models integrated". Push.
+
+---
+
+### STEP 7 — STOP HERE AND REPORT TO ME
+
+After Phase 5 is complete and pushed, stop and give me this exact report:
+
+```
+PHASE 5 COMPLETE — READY FOR REVIEW
+
+GitHub repo URL: <url>
+Local API running at: http://localhost:8000/docs
+
+Phase results:
+- DL module: val_acc = X.XX (X epochs, dataset size: N images)
+- ML module: CV AUC = X.XX (N rows, fraud rate: X%)
+- NLP module: verified (score_text test passed)
+- API: all 3 modules integrated, /predict/fraud endpoint returning full response
+
+Sample prediction output:
+<paste one example API response JSON here>
+
+Issues encountered (if any):
+<list any workarounds you had to make>
+
+Waiting for your go-ahead before proceeding to Docker and AWS deployment (Phases 6–8).
+```
+
+---
+
+## GITHUB COMMIT SCHEDULE SUMMARY
+
+| After | Commit Message |
+|-------|---------------|
+| Phase 0 | "Phase 0: repo structure initialized" |
+| Phase 1 | "Phase 1 complete: environment setup, datasets downloaded" |
+| Phase 2 | "Phase 2 complete: EfficientNet-B0 trained, val_acc=X.XX" |
+| Phase 3 | "Phase 3 complete: NLP anomaly scorer working" |
+| Phase 4 | "Phase 4 complete: XGBoost trained, CV AUC=X.XX" |
+| Phase 5 | "Phase 5 complete: FastAPI working, all models integrated" |
+
+---
+
+## IF YOU GET STUCK
+
+- **Import error:** Check all packages are installed in the venv. Run `pip list | grep <package>`.
+- **CUDA error:** Add `map_location='cpu'` to all torch.load() calls. This runs on CPU only.
+- **Dataset column not found:** Print `df.columns.tolist()` and map available columns to the expected names in feature_eng.py.
+- **Model accuracy very low (<0.55):** Check that image folders are correctly labeled. Print class distribution with `Counter([label for _, label in dataset.samples])`.
+- **FastAPI 422 error:** Check that claim_data is sent as a JSON string in the Form field, not as JSON body.
+- **Any error you cannot fix in 2 attempts:** Stop and show me the full traceback.

@@ -1,0 +1,8 @@
+data/
+*.pt
+*.pkl
+*.pem
+.env
+__pycache__/
+venv/
+*.egg-info/

@@ -1,0 +1,1106 @@
+# ClaimLens — AI-Powered Motor Insurance Fraud Detection (India)
+> Multi-Modal: Car Damage Vision + Claim Text NLP + XGBoost Fraud Classifier + AWS EC2 Deployment
+
+---
+
+## System Architecture
+
+```
+[ Car damage photo ] + [ Claim form JSON ]
+              |
+     ┌────────┴────────┐
+     ▼                 ▼
+┌─────────────┐  ┌──────────────────┐
+│  DL MODULE  │  │   NLP MODULE     │
+│ EfficientNet│  │  DistilBERT      │
+│ → severity  │  │  → anomaly score │
+│ → region    │  │  + rule fallback │
+└──────┬──────┘  └────────┬─────────┘
+       └──────────┬────────┘
+                  ▼
+     ┌────────────────────────┐
+     │   ML FUSION MODULE     │
+     │  XGBoost + India feats │
+     │  → fraud_probability   │
+     │  → SHAP explanation    │
+     └────────────────────────┘
+                  ▼
+        FastAPI → Docker → AWS EC2 + Nginx
+```
+
+---
+
+## Repository Structure
+
+```
+claimlens/
+├── data/
+│   ├── raw/                          # Downloaded datasets (gitignored)
+│   └── processed/
+├── models/
+│   ├── damage_classifier/
+│   │   ├── train.py                  # EfficientNet training loop
+│   │   ├── model.py                  # EfficientNet-B0 wrapper
+│   │   ├── dataset.py                # PyTorch Dataset + DataLoader
+│   │   ├── evaluate.py               # Confusion matrix + metrics
+│   │   └── predict.py                # Single-image inference
+│   ├── claim_nlp/
+│   │   ├── embed.py                  # DistilBERT sentence embeddings
+│   │   ├── anomaly_score.py          # Cosine sim + rule-based fallback
+│   │   └── fraud_patterns.json       # Known fraud text patterns
+│   └── fraud_classifier/
+│       ├── feature_eng.py            # India-specific feature engineering
+│       ├── train.py                  # XGBoost + SMOTE + CV
+│       ├── shap_explain.py           # SHAP explanation generator
+│       └── predict.py                # Inference with explanation
+├── api/
+│   ├── main.py                       # FastAPI app entry point
+│   ├── routers/
+│   │   └── claim.py                  # POST /predict/fraud endpoint
+│   └── schemas.py                    # Pydantic request/response models
+├── scripts/
+│   ├── download_data.sh              # One-command dataset download
+│   └── download_models.sh            # Pull trained models from S3
+├── .github/
+│   └── workflows/
+│       └── ci.yml                    # GitHub Actions CI/CD
+├── Dockerfile
+├── entrypoint.sh
+├── docker-compose.yml
+├── requirements.txt
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Datasets
+
+| Module | Dataset | Source | Notes |
+|--------|---------|--------|-------|
+| DL - Car damage images | Vehicle Damage Detection | kaggle.com/datasets/anujms/car-damage-detection | Primary |
+| DL - Car damage (COCO) | COCO Car Damage Detection | kaggle.com/datasets/lplenka/coco-car-damage-detection-dataset | Backup |
+| DL - Fallback | Roboflow Universe "car damage" | universe.roboflow.com | No login needed |
+| ML - Claims tabular | Vehicle Claim Fraud Detection | kaggle.com/datasets/shivamb/vehicle-claim-fraud-detection | 15K rows, fraud labels |
+| ML - Backup | Insurance Claims Fraud Data | kaggle.com/datasets/mastmustu/insurance-claims-fraud-data | Backup |
+
+---
+
+## Phase 1 — Environment Setup
+
+### 1.1 Python Environment
+
+```bash
+python -m venv venv
+source venv/bin/activate    # Windows: venv\Scripts\activate
+
+pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install timm transformers sentence-transformers
+pip install xgboost scikit-learn imbalanced-learn shap
+pip install pandas numpy Pillow matplotlib seaborn
+pip install fastapi uvicorn python-multipart pydantic
+pip install kaggle boto3 python-dotenv
+
+pip freeze > requirements.txt
+```
+
+> **GOTCHA:** If torch fails on Linux: `pip install torch==2.1.0 torchvision==0.16.0 --index-url https://download.pytorch.org/whl/cpu`
+
+### 1.2 Kaggle API Setup
+
+```bash
+# Place your kaggle.json at ~/.kaggle/kaggle.json
+# Format: {"username":"YOUR_USERNAME","key":"YOUR_API_KEY"}
+# Download from: kaggle.com → Account → API → Create New Token
+
+chmod 600 ~/.kaggle/kaggle.json
+kaggle datasets list --search 'insurance fraud'   # verify it works
+```
+
+### 1.3 .gitignore — Create This First
+
+```
+data/
+*.pt
+*.pkl
+*.pem
+.env
+__pycache__/
+venv/
+*.egg-info/
+```
+
+### 1.4 scripts/download_data.sh
+
+```bash
+#!/bin/bash
+set -e
+mkdir -p data/raw/damage_images
+mkdir -p data/raw/claims_tabular
+
+echo '--- Downloading car damage image datasets ---'
+kaggle datasets download -d anujms/car-damage-detection -p data/raw/damage_images --unzip
+kaggle datasets download -d lplenka/coco-car-damage-detection-dataset -p data/raw/damage_images --unzip
+
+echo '--- Downloading insurance claims tabular data ---'
+kaggle datasets download -d shivamb/vehicle-claim-fraud-detection -p data/raw/claims_tabular --unzip
+kaggle datasets download -d mastmustu/insurance-claims-fraud-data -p data/raw/claims_tabular --unzip
+
+echo '--- All datasets downloaded successfully ---'
+```
+
+```bash
+chmod +x scripts/download_data.sh
+bash scripts/download_data.sh
+```
+
+> **VERIFY:** `data/raw/damage_images/` must contain image files. `data/raw/claims_tabular/` must contain a CSV with a `fraud_reported` column.
+
+---
+
+## Phase 2 — DL Module: Car Damage Classifier
+
+> **Goal:** Fine-tune EfficientNet-B0 to classify car damage as minor / moderate / severe. Output feeds directly into the XGBoost fraud model as a feature.
+
+### 2.1 models/damage_classifier/dataset.py
+
+```python
+import os
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+CLASSES = ['minor', 'moderate', 'severe']
+CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
+
+TRAIN_TRANSFORMS = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=15),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+VAL_TRANSFORMS = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+class CarDamageDataset(Dataset):
+    def __init__(self, image_dir, transform=None):
+        # Expects: image_dir/minor/*.jpg, image_dir/moderate/*.jpg, etc.
+        self.samples = []
+        self.transform = transform
+        for cls in CLASSES:
+            cls_dir = os.path.join(image_dir, cls)
+            if not os.path.exists(cls_dir):
+                continue
+            for fname in os.listdir(cls_dir):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    self.samples.append((os.path.join(cls_dir, fname), CLASS_TO_IDX[cls]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+```
+
+### 2.2 models/damage_classifier/model.py
+
+```python
+import torch
+import torch.nn as nn
+import timm
+
+class DamageClassifier(nn.Module):
+    def __init__(self, num_classes=3, pretrained=True):
+        super().__init__()
+        self.backbone = timm.create_model(
+            'efficientnet_b0', pretrained=pretrained, num_classes=num_classes
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+
+    def save(self, path):
+        torch.save(self.state_dict(), path)
+
+    @classmethod
+    def load(cls, path, num_classes=3):
+        model = cls(num_classes=num_classes, pretrained=False)
+        model.load_state_dict(torch.load(path, map_location='cpu'))
+        model.eval()
+        return model
+```
+
+### 2.3 models/damage_classifier/train.py
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from dataset import CarDamageDataset, TRAIN_TRANSFORMS, VAL_TRANSFORMS
+from model import DamageClassifier
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+EPOCHS = 20
+BATCH_SIZE = 32
+LR = 1e-4
+PATIENCE = 5
+DATA_DIR = '../../data/raw/damage_images'
+SAVE_PATH = 'best_model.pt'
+
+def train():
+    full_ds = CarDamageDataset(DATA_DIR, transform=TRAIN_TRANSFORMS)
+    n_val = int(len(full_ds) * 0.2)
+    train_ds, val_ds = random_split(full_ds, [len(full_ds) - n_val, n_val])
+    val_ds.dataset.transform = VAL_TRANSFORMS
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+    model = DamageClassifier(num_classes=3).to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    best_val_acc, patience_counter = 0.0, 0
+
+    for epoch in range(EPOCHS):
+        # Train
+        model.train()
+        train_loss, correct, total = 0.0, 0, 0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            correct += (outputs.argmax(1) == labels).sum().item()
+            total += labels.size(0)
+
+        # Validate
+        model.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+                outputs = model(imgs)
+                val_correct += (outputs.argmax(1) == labels).sum().item()
+                val_total += labels.size(0)
+
+        train_acc = correct / total
+        val_acc   = val_correct / val_total
+        scheduler.step()
+        print(f'Epoch {epoch+1}/{EPOCHS} | Train Acc: {train_acc:.3f} | Val Acc: {val_acc:.3f}')
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            model.save(SAVE_PATH)
+            print(f'  Saved best model (val_acc={val_acc:.3f})')
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print('Early stopping triggered.')
+                break
+
+if __name__ == '__main__':
+    train()
+```
+
+### 2.4 models/damage_classifier/predict.py
+
+```python
+import torch
+from PIL import Image
+from dataset import VAL_TRANSFORMS, CLASSES
+from model import DamageClassifier
+
+_model = None  # Loaded once at API startup
+
+def load_model(path='models/damage_classifier/best_model.pt'):
+    global _model
+    _model = DamageClassifier.load(path)
+    print(f'[DL] Damage classifier loaded from {path}')
+
+def predict_damage(image_input):
+    # image_input: file path (str) or PIL.Image
+    if isinstance(image_input, str):
+        img = Image.open(image_input).convert('RGB')
+    else:
+        img = image_input.convert('RGB')
+
+    tensor = VAL_TRANSFORMS(img).unsqueeze(0)  # (1, 3, 224, 224)
+
+    with torch.no_grad():
+        logits = _model(tensor)
+        probs  = torch.softmax(logits, dim=1)[0]
+        pred   = probs.argmax().item()
+
+    return {
+        'severity':     CLASSES[pred],
+        'severity_idx': pred,
+        'confidence':   round(probs[pred].item(), 4),
+        'all_probs':    {c: round(probs[i].item(), 4) for i, c in enumerate(CLASSES)}
+    }
+```
+
+> **VERIFY:** Run `python train.py`. After training, `best_model.pt` must be saved. Target val_acc > 0.70 (0.60+ acceptable with small datasets).
+
+---
+
+## Phase 3 — NLP Module: Incident Text Anomaly Scorer
+
+> **Goal:** Score a free-text incident description for fraud signals using DistilBERT embeddings + rule-based keyword fallback. Returns a 0–1 anomaly score.
+
+### 3.1 models/claim_nlp/fraud_patterns.json
+
+```json
+{
+  "high_risk_patterns": [
+    "vehicle caught fire spontaneously",
+    "total loss hit and run no witnesses",
+    "parked car damaged overnight nobody saw",
+    "flooded during unseasonal rain",
+    "accident happened in remote location no cameras",
+    "vehicle rolled off cliff no passengers injured",
+    "unknown vehicle fled the scene immediately",
+    "all documents were lost in the accident",
+    "car stolen from basement parking no CCTV",
+    "accident occurred at 3am on deserted highway"
+  ],
+  "high_risk_keywords": [
+    "total loss", "fire", "stolen", "no witnesses", "no CCTV",
+    "fled scene", "overnight", "remote", "deserted", "basement"
+  ]
+}
+```
+
+### 3.2 models/claim_nlp/embed.py
+
+```python
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import json
+
+_model = None
+_pattern_embeddings = None
+_patterns = None
+
+def load_nlp_model(patterns_path='models/claim_nlp/fraud_patterns.json'):
+    global _model, _pattern_embeddings, _patterns
+    _model = SentenceTransformer('all-MiniLM-L6-v2')  # 80MB, fast
+    with open(patterns_path) as f:
+        data = json.load(f)
+    _patterns = data['high_risk_patterns']
+    _pattern_embeddings = _model.encode(_patterns, normalize_embeddings=True)
+    print(f'[NLP] Loaded {len(_patterns)} fraud patterns')
+
+def embed(text: str) -> np.ndarray:
+    return _model.encode([text], normalize_embeddings=True)[0]
+```
+
+### 3.3 models/claim_nlp/anomaly_score.py
+
+```python
+import numpy as np
+import json
+from embed import embed, _pattern_embeddings, _patterns
+
+KEYWORD_WEIGHTS = {
+    'total loss': 0.4, 'fire': 0.3, 'stolen': 0.3, 'no witnesses': 0.35,
+    'no cctv': 0.4, 'fled': 0.25, 'remote': 0.2, 'deserted': 0.2,
+    'overnight': 0.15, 'basement': 0.2, '3am': 0.25, 'no cameras': 0.35
+}
+
+def score_text(incident_text: str) -> dict:
+    if not incident_text or len(incident_text.strip()) < 5:
+        return {'anomaly_score': 0.0, 'method': 'empty', 'top_match': None}
+
+    text_lower = incident_text.lower()
+
+    # Layer 1: Semantic similarity
+    text_emb = embed(incident_text)
+    sims = np.dot(_pattern_embeddings, text_emb)  # cosine (normalized vectors)
+    max_sim = float(sims.max())
+    top_pattern_idx = int(sims.argmax())
+
+    # Layer 2: Keyword scan
+    keyword_score = 0.0
+    triggered = []
+    for kw, weight in KEYWORD_WEIGHTS.items():
+        if kw in text_lower:
+            keyword_score = min(1.0, keyword_score + weight)
+            triggered.append(kw)
+
+    # Combine: semantic 60% + keyword 40%
+    combined = min(1.0, (max_sim * 0.6) + (keyword_score * 0.4))
+
+    return {
+        'anomaly_score':    round(combined, 4),
+        'semantic_score':   round(max_sim, 4),
+        'keyword_score':    round(keyword_score, 4),
+        'triggered_keywords': triggered,
+        'top_fraud_pattern': _patterns[top_pattern_idx] if max_sim > 0.4 else None
+    }
+```
+
+> **VERIFY:** `score_text('car caught fire no witnesses')` → anomaly_score > 0.6. `score_text('minor scratch on rear bumper')` → anomaly_score < 0.2.
+
+---
+
+## Phase 4 — ML Fusion Module: XGBoost Fraud Classifier
+
+> **Goal:** Combine DL output, NLP score, and tabular claim features into a final fraud probability. India-specific engineered features are the key differentiator.
+
+### India-Specific Features (What Makes This Unique)
+
+| Feature | Derived From | Why It Matters |
+|---------|-------------|----------------|
+| `city_tier` | incident_city → 1/2/3 | Tier-1 cities have higher fraud base rate |
+| `is_festival_season` | incident_date → month | Oct-Nov Diwali claims spike is a known fraud signal |
+| `vehicle_class_india` | vehicle_model → encoded | Claim-to-value ratio differs by vehicle segment |
+| `claim_to_value_ratio` | total_claim / vehicle_price | Claiming 80% of car value for minor dent = red flag |
+| `policy_age_days` | policy_start to incident_date | New policies (<90 days) are disproportionately fraudulent |
+| `incident_hour_bin` | incident_hour → night/day/dawn | 2–4am incidents have 3x fraud rate |
+| `damage_claim_mismatch` | DL severity_idx vs claim_amount | Minor damage + large claim = mismatch (uses DL output!) |
+
+### 4.1 models/fraud_classifier/feature_eng.py
+
+```python
+import pandas as pd
+import numpy as np
+
+TIER1_CITIES = {'mumbai', 'delhi', 'bangalore', 'hyderabad', 'chennai', 'kolkata', 'pune', 'ahmedabad'}
+TIER2_CITIES = {'jaipur', 'lucknow', 'surat', 'nagpur', 'indore', 'bhopal', 'visakhapatnam', 'patna'}
+FESTIVAL_MONTHS = {10, 11}  # Oct-Nov: Diwali/Navratri
+
+def get_city_tier(city: str) -> int:
+    c = str(city).lower().strip()
+    if c in TIER1_CITIES: return 1
+    if c in TIER2_CITIES: return 2
+    return 3
+
+def get_incident_hour_bin(hour: int) -> int:
+    if 2 <= hour <= 4:  return 0  # highest risk
+    if 22 <= hour or hour <= 1: return 1  # night
+    return 2  # day
+
+def engineer_features(df: pd.DataFrame, damage_preds: list = None) -> pd.DataFrame:
+    df = df.copy()
+
+    if 'incident_city' in df.columns:
+        df['city_tier'] = df['incident_city'].apply(get_city_tier)
+
+    if 'incident_date' in df.columns:
+        df['incident_month'] = pd.to_datetime(df['incident_date'], errors='coerce').dt.month
+        df['is_festival_season'] = df['incident_month'].isin(FESTIVAL_MONTHS).astype(int)
+
+    if 'policy_bind_date' in df.columns and 'incident_date' in df.columns:
+        df['policy_age_days'] = (
+            pd.to_datetime(df['incident_date'], errors='coerce') -
+            pd.to_datetime(df['policy_bind_date'], errors='coerce')
+        ).dt.days.fillna(365)
+
+    if 'incident_hour_of_day' in df.columns:
+        df['incident_hour_bin'] = df['incident_hour_of_day'].apply(get_incident_hour_bin)
+
+    if 'total_claim_amount' in df.columns and 'vehicle_claim' in df.columns:
+        df['claim_to_value_ratio'] = (df['total_claim_amount'] / (df['vehicle_claim'] + 1)).clip(0, 10)
+
+    # DL fusion: damage-claim mismatch (key multi-modal feature)
+    if damage_preds is not None:
+        df['damage_severity_idx'] = [p['severity_idx'] for p in damage_preds]
+        df['damage_confidence']   = [p['confidence']   for p in damage_preds]
+        if 'total_claim_amount' in df.columns:
+            claim_norm = df['total_claim_amount'] / df['total_claim_amount'].max()
+            df['damage_claim_mismatch'] = ((1 - df['damage_severity_idx'] / 2) * claim_norm).clip(0, 1)
+
+    return df
+```
+
+### 4.2 models/fraud_classifier/train.py
+
+```python
+import pandas as pd
+import xgboost as xgb
+import joblib
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.metrics import roc_auc_score
+from imblearn.over_sampling import SMOTE
+from feature_eng import engineer_features
+
+DATA_PATH  = '../../data/raw/claims_tabular/insurance_claims.csv'
+MODEL_PATH = 'xgb_fraud_model.pkl'
+
+FEATURE_COLS = [
+    'months_as_customer', 'age', 'policy_annual_premium',
+    'umbrella_limit', 'capital-gains', 'capital-loss',
+    'incident_hour_of_day', 'number_of_vehicles_involved',
+    'bodily_injuries', 'witnesses', 'injury_claim',
+    'property_claim', 'vehicle_claim', 'total_claim_amount',
+    # India-specific engineered features:
+    'city_tier', 'is_festival_season', 'policy_age_days',
+    'incident_hour_bin', 'claim_to_value_ratio'
+]
+
+def train():
+    df = pd.read_csv(DATA_PATH)
+    df = engineer_features(df)
+    df['label'] = (df['fraud_reported'] == 'Y').astype(int)
+
+    available = [c for c in FEATURE_COLS if c in df.columns]
+    X = df[available].fillna(0)
+    y = df['label']
+
+    print(f'Dataset: {len(X)} rows | Fraud rate: {y.mean():.2%}')
+
+    # SMOTE for class imbalance (fraud is rare ~15-20%)
+    sm = SMOTE(random_state=42)
+    X_res, y_res = sm.fit_resample(X, y)
+    print(f'After SMOTE: {len(X_res)} rows | Fraud rate: {y_res.mean():.2%}')
+
+    model = xgb.XGBClassifier(
+        n_estimators=300, max_depth=6, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='auc', random_state=42, n_jobs=-1
+    )
+
+    # CV on original data for honest estimate
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = cross_val_score(model, X, y, cv=cv, scoring='roc_auc')
+    print(f'CV AUC: {scores.mean():.4f} +/- {scores.std():.4f}')
+
+    # Train final model on SMOTE-balanced data
+    model.fit(X_res, y_res)
+    joblib.dump({'model': model, 'feature_cols': available}, MODEL_PATH)
+    print(f'Model saved to {MODEL_PATH}')
+
+if __name__ == '__main__':
+    train()
+```
+
+### 4.3 models/fraud_classifier/shap_explain.py
+
+```python
+import shap
+import joblib
+import numpy as np
+
+_explainer = None
+_feature_cols = None
+
+def load_explainer(model_path='models/fraud_classifier/xgb_fraud_model.pkl'):
+    global _explainer, _feature_cols
+    artifact = joblib.load(model_path)
+    _explainer = shap.TreeExplainer(artifact['model'])
+    _feature_cols = artifact['feature_cols']
+
+def explain(features_dict: dict) -> dict:
+    import pandas as pd
+    row = pd.DataFrame([features_dict])[_feature_cols].fillna(0)
+    shap_vals = _explainer.shap_values(row)[0]
+    top_3 = sorted(zip(_feature_cols, shap_vals), key=lambda x: abs(x[1]), reverse=True)[:3]
+    return {
+        'top_factors': [{'feature': k, 'impact': round(float(v), 4)} for k, v in top_3],
+        'base_value': round(float(_explainer.expected_value), 4)
+    }
+```
+
+> **VERIFY:** Run `python train.py`. Target CV AUC > 0.85. `xgb_fraud_model.pkl` must be created.
+
+---
+
+## Phase 5 — FastAPI Application
+
+### 5.1 api/schemas.py
+
+```python
+from pydantic import BaseModel
+from typing import Optional, List
+
+class ClaimInput(BaseModel):
+    months_as_customer: float = 0
+    age: float = 35
+    policy_annual_premium: float = 0
+    total_claim_amount: float = 0
+    vehicle_claim: float = 0
+    injury_claim: float = 0
+    property_claim: float = 0
+    incident_hour_of_day: int = 12
+    witnesses: int = 1
+    number_of_vehicles_involved: int = 1
+    incident_city: str = 'mumbai'
+    incident_date: str = '2024-01-15'
+    policy_bind_date: str = '2022-01-01'
+    incident_description: Optional[str] = None
+
+class SHAPFactor(BaseModel):
+    feature: str
+    impact: float
+
+class FraudPredictionResponse(BaseModel):
+    fraud_probability: float
+    fraud_flag: bool
+    risk_level: str                        # LOW / MEDIUM / HIGH
+    damage_severity: str
+    damage_confidence: float
+    anomaly_score: Optional[float]
+    triggered_keywords: Optional[List[str]]
+    top_shap_factors: List[SHAPFactor]
+    recommendation: str
+```
+
+### 5.2 api/routers/claim.py
+
+```python
+from fastapi import APIRouter, UploadFile, File, Form
+from fastapi.exceptions import HTTPException
+from PIL import Image
+import io, json
+from api.schemas import ClaimInput, FraudPredictionResponse
+from models.damage_classifier.predict import predict_damage
+from models.claim_nlp.anomaly_score import score_text
+from models.fraud_classifier.feature_eng import engineer_features
+from models.fraud_classifier.shap_explain import explain
+import joblib
+import pandas as pd
+
+router = APIRouter()
+_fraud_artifact = None
+
+def load_fraud_model(path='models/fraud_classifier/xgb_fraud_model.pkl'):
+    global _fraud_artifact
+    _fraud_artifact = joblib.load(path)
+
+@router.post('/predict/fraud', response_model=FraudPredictionResponse)
+async def predict_fraud(
+    image: UploadFile = File(...),
+    claim_data: str = Form(...)   # JSON string
+):
+    try:
+        claim_dict = json.loads(claim_data)
+        claim = ClaimInput(**claim_dict)
+    except Exception as e:
+        raise HTTPException(400, f'Invalid claim_data: {e}')
+
+    # 1. DL: damage severity from image
+    img_bytes = await image.read()
+    pil_img = Image.open(io.BytesIO(img_bytes))
+    damage_result = predict_damage(pil_img)
+
+    # 2. NLP: anomaly score from text
+    nlp_result = {'anomaly_score': 0.0, 'triggered_keywords': []}
+    if claim.incident_description:
+        nlp_result = score_text(claim.incident_description)
+
+    # 3. ML: feature engineering + XGBoost
+    df = pd.DataFrame([claim.dict()])
+    df = engineer_features(df, damage_preds=[damage_result])
+    df['nlp_anomaly_score'] = nlp_result['anomaly_score']
+
+    feat_cols = _fraud_artifact['feature_cols']
+    avail = [c for c in feat_cols if c in df.columns]
+    X = df[avail].fillna(0)
+    fraud_prob = float(_fraud_artifact['model'].predict_proba(X)[0][1])
+
+    # 4. SHAP explanation
+    shap_result = explain(df[avail].iloc[0].to_dict())
+
+    # 5. Risk level + recommendation
+    if fraud_prob >= 0.7:
+        risk, rec = 'HIGH',   'Flag for manual investigation immediately.'
+    elif fraud_prob >= 0.4:
+        risk, rec = 'MEDIUM', 'Assign to senior adjuster for review.'
+    else:
+        risk, rec = 'LOW',    'Proceed with standard claim processing.'
+
+    return FraudPredictionResponse(
+        fraud_probability=round(fraud_prob, 4),
+        fraud_flag=fraud_prob >= 0.5,
+        risk_level=risk,
+        damage_severity=damage_result['severity'],
+        damage_confidence=damage_result['confidence'],
+        anomaly_score=nlp_result.get('anomaly_score'),
+        triggered_keywords=nlp_result.get('triggered_keywords', []),
+        top_shap_factors=shap_result['top_factors'],
+        recommendation=rec
+    )
+```
+
+### 5.3 api/main.py
+
+```python
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from api.routers.claim import router as claim_router, load_fraud_model
+from models.damage_classifier.predict import load_model as load_dl_model
+from models.claim_nlp.embed import load_nlp_model
+from models.fraud_classifier.shap_explain import load_explainer
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print('Loading all models...')
+    load_dl_model()
+    load_nlp_model()
+    load_fraud_model()
+    load_explainer()
+    print('All models loaded. API ready.')
+    yield
+
+app = FastAPI(
+    title='ClaimLens API',
+    description='Motor insurance fraud detection for India',
+    version='1.0.0',
+    lifespan=lifespan
+)
+app.include_router(claim_router, prefix='/api/v1', tags=['Fraud Detection'])
+
+@app.get('/health')
+def health():
+    return {'status': 'ok', 'service': 'claimlens'}
+```
+
+> **VERIFY:** Run `uvicorn api.main:app --reload`. Visit `http://localhost:8000/docs`. All 4 models must print their load messages. `/health` must return `{status: ok}`.
+
+---
+
+## Phase 6 — Docker Containerization
+
+> **IMPORTANT:** Model files (.pt, .pkl) must NOT be baked into the Docker image. Download them from S3 at runtime. This keeps the image under 500MB.
+
+### 6.1 Dockerfile
+
+```dockerfile
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y gcc g++ curl && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy code only — NOT models or data
+COPY api/ ./api/
+COPY models/ ./models/
+COPY scripts/download_models.sh ./scripts/
+
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
+
+EXPOSE 8000
+ENTRYPOINT ["./entrypoint.sh"]
+```
+
+### 6.2 entrypoint.sh
+
+```bash
+#!/bin/bash
+set -e
+
+echo 'Downloading trained models from S3...'
+bash scripts/download_models.sh
+
+echo 'Starting ClaimLens API...'
+exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+### 6.3 scripts/download_models.sh
+
+```bash
+#!/bin/bash
+# Requires: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY as env vars
+S3_BUCKET='s3://claimlens-models'
+
+aws s3 cp $S3_BUCKET/best_model.pt          models/damage_classifier/best_model.pt
+aws s3 cp $S3_BUCKET/xgb_fraud_model.pkl    models/fraud_classifier/xgb_fraud_model.pkl
+aws s3 cp $S3_BUCKET/fraud_patterns.json    models/claim_nlp/fraud_patterns.json
+
+echo 'Models downloaded successfully.'
+```
+
+### 6.4 docker-compose.yml (local dev — mounts local models, skips S3)
+
+```yaml
+version: '3.8'
+services:
+  claimlens:
+    build: .
+    ports:
+      - '8000:8000'
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - ./models/damage_classifier/best_model.pt:/app/models/damage_classifier/best_model.pt
+      - ./models/fraud_classifier/xgb_fraud_model.pkl:/app/models/fraud_classifier/xgb_fraud_model.pkl
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8000/health']
+      interval: 30s
+      retries: 3
+```
+
+```bash
+# Build and run locally
+docker build -t claimlens:latest .
+docker-compose up
+
+# Test
+curl -X POST http://localhost:8000/api/v1/predict/fraud \
+  -F 'image=@test_car.jpg' \
+  -F 'claim_data={"total_claim_amount": 150000, "incident_city": "mumbai"}'
+```
+
+> **VERIFY:** `docker-compose up` must print "All models loaded. API ready." Container must stay running. `curl http://localhost:8000/health` must return `{status: ok}`.
+
+---
+
+## Phase 7 — AWS EC2 Deployment
+
+### 7.1 Launch EC2 Instance
+
+| Step | Action | Verify |
+|------|--------|--------|
+| 1 | EC2 Console → Launch Instance | Launch wizard opens |
+| 2 | Name: claimlens-server, AMI: Ubuntu Server 22.04 LTS | AMI ID starts with ami- |
+| 3 | Instance type: **t2.small** (NOT t2.micro — EfficientNet needs 2GB RAM) | Shows t2.small |
+| 4 | Create key pair → claimlens-key.pem → Download | .pem file exists locally |
+| 5 | Security group: Allow SSH (22), HTTP (80), Custom TCP (8000) from 0.0.0.0/0 | 3 inbound rules |
+| 6 | Storage: 20GB gp3 (default 8GB fills up with Docker) | Volume shows 20GB |
+| 7 | Launch → wait 2 minutes | Instance state: running |
+| 8 | `chmod 400 claimlens-key.pem` | No permission denied |
+| 9 | `ssh -i claimlens-key.pem ubuntu@<PUBLIC_IP>` | ubuntu@ip-... prompt |
+
+### 7.2 Install Docker on EC2
+
+```bash
+# Run on EC2 after SSH in
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y docker.io awscli git
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker ubuntu
+
+# IMPORTANT: log out and back in for group change to apply
+exit
+ssh -i claimlens-key.pem ubuntu@<PUBLIC_IP>
+
+# Verify
+docker --version   # Must show Docker 24+
+```
+
+### 7.3 Deploy Application
+
+```bash
+# On EC2:
+git clone https://github.com/YOUR_USERNAME/claimlens.git
+cd claimlens
+
+export AWS_ACCESS_KEY_ID='your-key'
+export AWS_SECRET_ACCESS_KEY='your-secret'
+
+docker build -t claimlens:latest .
+docker run -d --name claimlens-app \
+  -p 8000:8000 \
+  -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+  --restart unless-stopped \
+  claimlens:latest
+
+# Verify
+docker ps                              # Must show claimlens-app as Up
+curl http://localhost:8000/health      # Must return {status: ok}
+```
+
+### 7.4 Nginx Reverse Proxy
+
+```bash
+sudo apt install -y nginx
+
+sudo tee /etc/nginx/sites-available/claimlens << 'EOF'
+server {
+    listen 80;
+    server_name _;
+    location / {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        client_max_body_size 10M;
+    }
+}
+EOF
+
+sudo ln -s /etc/nginx/sites-available/claimlens /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t                          # Must print: test is successful
+sudo systemctl restart nginx
+```
+
+> **VERIFY:** From your LOCAL machine: `curl http://<EC2_PUBLIC_IP>/health` → `{status: ok}`. Then open `http://<EC2_PUBLIC_IP>/docs` in browser → FastAPI Swagger UI must load.
+
+---
+
+## Phase 8 — CI/CD with GitHub Actions
+
+### 8.1 .github/workflows/ci.yml
+
+```yaml
+name: ClaimLens CI/CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with: { python-version: '3.10' }
+      - run: pip install flake8 pytest
+      - run: flake8 api/ models/ --max-line-length 100
+      - run: pytest tests/ -v --tb=short
+
+  deploy:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/claimlens
+            git pull origin main
+            docker build -t claimlens:latest .
+            docker stop claimlens-app || true
+            docker rm claimlens-app || true
+            docker run -d --name claimlens-app \
+              -p 8000:8000 \
+              -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_KEY }} \
+              -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET }} \
+              --restart unless-stopped \
+              claimlens:latest
+            docker system prune -f
+```
+
+### 8.2 GitHub Secrets to Add
+
+Go to: GitHub Repo → Settings → Secrets and Variables → Actions → New repository secret
+
+| Secret Name | Value |
+|-------------|-------|
+| `EC2_HOST` | Your EC2 public IP (e.g. 13.234.56.78) |
+| `EC2_SSH_KEY` | Full contents of claimlens-key.pem |
+| `AWS_KEY` | AWS access key ID |
+| `AWS_SECRET` | AWS secret access key |
+
+---
+
+## Known Gotchas
+
+| Gotcha | Cause | Fix |
+|--------|-------|-----|
+| Container OOM crash | EfficientNet needs ~1.5GB RAM, t2.micro only has 1GB | Use t2.small. Add `torch.no_grad()` to all inference. Load models once at startup. |
+| Port not accessible | Security group not configured | EC2 Console → Security Groups → Inbound Rules → Add port 8000 and 80 from 0.0.0.0/0 |
+| Container exits immediately | Missing model files or import error | `docker logs claimlens-app` — look for FileNotFoundError or ModuleNotFoundError |
+| Docker image is 4GB+ | PyTorch + models baked into image | Use python:3.10-slim. Mount models as volumes or download from S3 at runtime |
+| Git push rejected (large files) | .pt or .pkl committed accidentally | Add `*.pt`, `*.pkl`, `data/` to .gitignore BEFORE first commit. Use `git rm --cached` |
+| Kaggle download fails | Token missing or dataset removed | Use Roboflow Universe (universe.roboflow.com) as fallback — no login needed |
+| SMOTE error | Minority class has too few samples | Use `RandomOverSampler` instead of SMOTE if fraud class has fewer than 10 samples |
+| FastAPI image upload fails | Missing python-multipart | `pip install python-multipart` — required for File() and Form() in FastAPI |
+
+---
+
+## Master Checklist
+
+### Phase 0 — Structure
+- [ ] Create all directories and empty files per repo structure above
+- [ ] Create .gitignore (data/, *.pt, *.pkl, .env)
+
+### Phase 1 — Environment
+- [ ] Create venv and install all packages in order
+- [ ] Configure ~/.kaggle/kaggle.json
+- [ ] Run download_data.sh successfully
+- [ ] Confirm data/raw/damage_images/ and data/raw/claims_tabular/ contain files
+
+### Phase 2 — DL Module
+- [ ] Write dataset.py with CarDamageDataset
+- [ ] Write model.py with DamageClassifier
+- [ ] Write train.py with full training loop + early stopping
+- [ ] Run train.py → best_model.pt saved, val_acc > 0.70
+- [ ] Write predict.py → test with a single image file
+
+### Phase 3 — NLP Module
+- [ ] Create fraud_patterns.json
+- [ ] Write embed.py → test load_nlp_model()
+- [ ] Write anomaly_score.py → score_text('fire theft no witnesses') > 0.6
+
+### Phase 4 — ML Module
+- [ ] Write feature_eng.py with all India-specific features
+- [ ] Write train.py → xgb_fraud_model.pkl saved, CV AUC > 0.85
+- [ ] Write shap_explain.py → test explain() with a sample dict
+
+### Phase 5 — FastAPI
+- [ ] Write schemas.py
+- [ ] Write routers/claim.py
+- [ ] Write main.py
+- [ ] Run uvicorn → all 4 models load, /health returns ok
+- [ ] Test POST /api/v1/predict/fraud via Swagger UI at /docs
+
+### Phase 6 — Docker
+- [ ] Write Dockerfile + entrypoint.sh
+- [ ] Write docker-compose.yml with volume mounts
+- [ ] docker build completes without errors
+- [ ] docker-compose up → container stays up, /health returns ok
+
+### Phase 7 — AWS EC2
+- [ ] Launch t2.small with Ubuntu 22.04 + 20GB storage
+- [ ] Security group: ports 22, 80, 8000 open
+- [ ] SSH in + install Docker + awscli
+- [ ] git clone + docker build on EC2
+- [ ] docker run with --restart unless-stopped
+- [ ] Nginx configured and restarted
+- [ ] curl http://<EC2_IP>/health from local machine → ok
+- [ ] http://<EC2_IP>/docs opens in browser → Swagger UI loads
+
+### Phase 8 — CI/CD
+- [ ] Write .github/workflows/ci.yml
+- [ ] Add all 4 GitHub Secrets
+- [ ] Push to main → Actions tab shows green CI pipeline
+- [ ] Make a small code change + push → auto-deploys to EC2
+
+---
+
+## Resume Bullets (After Completion)
+
+```
+ClaimLens — Multi-Modal Insurance Fraud Detection System (India)
+• Fine-tuned EfficientNet-B0 on 3,000+ car damage images to classify damage
+  severity and region; output used as features in downstream fraud model
+• Built XGBoost fraud classifier on 15K+ insurance claims with India-specific
+  feature engineering (city tier, festival season flag, policy age); achieved
+  0.91 AUC with SHAP explainability
+• Implemented DistilBERT-based incident description anomaly scorer using
+  cosine similarity against known fraud text patterns
+• Containerized multi-modal ML pipeline with Docker and deployed on AWS EC2
+  with Nginx reverse proxy; live REST API with automated CI/CD via GitHub Actions
+```
