@@ -1,0 +1,26 @@
+{
+    "high_risk_patterns": [
+        "vehicle caught fire spontaneously",
+        "total loss hit and run no witnesses",
+        "parked car damaged overnight nobody saw",
+        "flooded during unseasonal rain",
+        "accident happened in remote location no cameras",
+        "vehicle rolled off cliff no passengers injured",
+        "unknown vehicle fled the scene immediately",
+        "all documents were lost in the accident",
+        "car stolen from basement parking no CCTV",
+        "accident occurred at 3am on deserted highway"
+    ],
+    "high_risk_keywords": [
+        "total loss",
+        "fire",
+        "stolen",
+        "no witnesses",
+        "no CCTV",
+        "fled scene",
+        "overnight",
+        "remote",
+        "deserted",
+        "basement"
+    ]
+}
